@@ -1,0 +1,17 @@
+{
+  "forecast_horizon_minutes": 15,
+  "time_resolution_minutes": 5,
+  "features": [
+    "headcount",
+    "headcount_rolling_15min",
+    "headcount_trend",
+    "is_weekend_future",
+    "working_weekday_hour_future",
+    "hour_sin_future",
+    "hour_cos_future",
+    "day_sin_future",
+    "day_cos_future"
+  ],
+  "target": "headcount_target_15min",
+  "notes": "Computed by feature_engineering.build_features(). 'headcount' and 'headcount_rolling_15min' use ACTUAL occupancy up to and including the current timestamp; the '_future' calendar features use (current timestamp + 15 minutes)."
+}
