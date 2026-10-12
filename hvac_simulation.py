@@ -1,16 +1,13 @@
 """
 hvac_simulation.py
 
-1R1C HVAC simulator: scheduled baseline vs thermal-predictive control.
+1R1C HVAC simulator: scheduled baseline vs state-based predictive control.
 
 This module knows nothing about how occupancy_now / occupancy_forecast
 were produced -- it only needs a DataFrame with the columns described
 in `run_simulation`. That decoupling is what lets the same simulator
 run on a historical backtest (with a known future to validate against)
 or on a live Streamlit upload (with no known future).
-
-Ported, unchanged in behaviour, from Occupancy_Prediction_Ver1_5.ipynb,
-section "HVAC Model".
 """
 
 from __future__ import annotations
@@ -47,8 +44,6 @@ class HVACConfig:
     fallback_outdoor_temp_c: float = 33.0
 
     # 1R1C building parameters -- PROTOTYPE VALUES.
-    # These must be calibrated against the real room before any energy
-    # or comfort number from this simulator is reported as a result.
     r_thermal_k_per_w: float = 0.01
     c_thermal_j_per_k: float = 1_000_000.0
 
@@ -64,10 +59,10 @@ class HVACConfig:
     fan_power_w: float = 0.0
     initial_room_temp_c: float = 33.0
 
-    # Predictive controller
+    # Predictive controller (State-Based)
     predictive_occupancy_threshold: float = 1.0
-    forecast_trigger_margin_c: float = 0.05
-    predictive_bisection_iterations: int = 24
+    state_s2_deadband_c: float = 5.0               # Deadband for Low Occupancy
+    state_s3_deadband_c: float = 3.0               # Deadband for High Occupancy
 
     @property
     def dt_seconds(self) -> float:
@@ -83,11 +78,8 @@ class HVACConfig:
 
     @property
     def thermostat_deadband_c(self) -> float:
+        # Default fallback deadband for scheduled mode
         return self.comfort_max_c - self.comfort_min_c
-
-    @property
-    def predictive_target_c(self) -> float:
-        return self.thermostat_setpoint_c
 
     @property
     def control_steps(self) -> int:
@@ -132,15 +124,7 @@ def scheduled_enable(timestamp, cfg: HVACConfig):
 
 
 def working_hours_mask(timestamp: pd.Series, cfg: HVACConfig) -> pd.Series:
-    """
-    Vectorised version of scheduled_enable()'s window, for filtering a
-    results DataFrame down to the working-hours window (cfg.schedule_start_hour
-    to cfg.schedule_end_hour, weekdays only if cfg.schedule_weekdays_only).
-
-    Used by calculate_kpis() so KPIs reflect working hours only, regardless
-    of which strategy ('scheduled' or 'predictive') actually controlled the
-    HVAC at any given timestep.
-    """
+    """Vectorised version of scheduled_enable()'s window."""
     timestamp = pd.to_datetime(timestamp)
     hour_decimal = timestamp.dt.hour + timestamp.dt.minute / 60
     mask = (hour_decimal >= cfg.schedule_start_hour) & (hour_decimal < cfg.schedule_end_hour)
@@ -153,12 +137,7 @@ def forecast_1r1c_temperature(
     T_start_C, T_outdoor_C, occ_now, occ_future, cfg: HVACConfig,
     Q_cooling_W=0.0, horizon_steps=None
 ):
-    """
-    Forecast future room temperature with the 1R1C model, blending
-    occupancy from its CURRENT measured value (occ_now) to its
-    forecast-horizon-ahead predicted value (occ_future) across the
-    horizon, rather than assuming occupancy is constant.
-    """
+    """Forecast future room temperature with the 1R1C model."""
     if horizon_steps is None:
         horizon_steps = cfg.prediction_horizon_steps
 
@@ -184,53 +163,47 @@ def forecast_1r1c_temperature(
     return T_pred_C
 
 
-def minimum_predictive_cooling(T_room_C, T_outdoor_C, occ_now, occ_future, cfg: HVACConfig):
+def minimum_predictive_cooling(
+    T_room_C, occ_future, previous_Q_W, cfg: HVACConfig
+):
     """
-    1R1C-based predictive HVAC decision that considers BOTH the
-    current measured occupancy and the forecast-horizon-ahead
-    occupancy prediction.
+    State-Based Predictive Control (No temperature forecasting):
+    - Classifies predicted occupancy (t+15) into S1/S2/S3.
+    - S1: HVAC OFF.
+    - S2: Deadband = 5C (bounds: 21.8C to 26.8C).
+    - S3: Deadband = 3C (bounds: 22.8C to 25.8C).
+    - Uses current room temperature and hysteresis to determine ON/OFF.
     """
-    occ_now_c, _, _ = classify_occupancy_state(occ_now)
     occ_future_c, state_label, state_description = classify_occupancy_state(occ_future)
 
-    T_future_no_hvac_C = forecast_1r1c_temperature(
-        T_room_C, T_outdoor_C, occ_now_c, occ_future_c, cfg, Q_cooling_W=0.0
-    )
+    # S1: Vacant -> HVAC OFF
+    if state_label == 'S1':
+        return 0.0, state_label, state_description
 
-    if max(occ_now_c, occ_future_c) < cfg.predictive_occupancy_threshold:
-        return 0.0, T_future_no_hvac_C, T_future_no_hvac_C, state_label, state_description
+    # Determine deadband based on predicted state
+    if state_label == 'S2':
+        deadband = cfg.state_s2_deadband_c
+    else: # S3
+        deadband = cfg.state_s3_deadband_c
 
-    if T_future_no_hvac_C <= cfg.comfort_max_c + cfg.forecast_trigger_margin_c:
-        return 0.0, T_future_no_hvac_C, T_future_no_hvac_C, state_label, state_description
+    setpoint = cfg.thermostat_setpoint_c
+    upper_limit = setpoint + deadband / 2
+    lower_limit = setpoint - deadband / 2
 
-    low_W, high_W = 0.0, cfg.q_cooling_max_w
+    # Hysteresis ON/OFF decision based on current room temperature
+    if T_room_C >= upper_limit:
+        Q_command = cfg.q_cooling_max_w
+    elif T_room_C <= lower_limit:
+        Q_command = 0.0
+    else:
+        # Maintain previous state if within bounds
+        Q_command = previous_Q_W
 
-    T_at_max_C = forecast_1r1c_temperature(
-        T_room_C, T_outdoor_C, occ_now_c, occ_future_c, cfg, Q_cooling_W=high_W
-    )
-    if T_at_max_C > cfg.predictive_target_c:
-        return high_W, T_future_no_hvac_C, T_at_max_C, state_label, state_description
-
-    for _ in range(cfg.predictive_bisection_iterations):
-        mid_W = 0.5 * (low_W + high_W)
-        T_mid_C = forecast_1r1c_temperature(
-            T_room_C, T_outdoor_C, occ_now_c, occ_future_c, cfg, Q_cooling_W=mid_W
-        )
-        if T_mid_C > cfg.predictive_target_c:
-            low_W = mid_W
-        else:
-            high_W = mid_W
-
-    Q_command_W = high_W
-    T_future_with_command_C = forecast_1r1c_temperature(
-        T_room_C, T_outdoor_C, occ_now_c, occ_future_c, cfg, Q_cooling_W=Q_command_W
-    )
-
-    return Q_command_W, T_future_no_hvac_C, T_future_with_command_C, state_label, state_description
+    return Q_command, state_label, state_description
 
 
 def thermostat_cooling(T_room_C, hvac_enable, cooling_on_memory, cfg: HVACConfig):
-    """Common thermostat logic used by BOTH strategies."""
+    """Common thermostat logic used by SCHEDULED strategy."""
     upper_limit = cfg.thermostat_setpoint_c + cfg.thermostat_deadband_c / 2
     lower_limit = cfg.thermostat_setpoint_c - cfg.thermostat_deadband_c / 2
 
@@ -255,14 +228,7 @@ def thermostat_cooling(T_room_C, hvac_enable, cooling_on_memory, cfg: HVACConfig
 
 
 def resolve_outdoor_temperature(occupancy_df: pd.DataFrame, cfg: HVACConfig, column: str | None = None):
-    """
-    Return an outdoor-temperature Series aligned to occupancy_df.
-
-    If `column` is given and present, use it (forward/back-filling any
-    gaps). Otherwise fall back to a constant, and say so -- silently
-    assuming a constant outdoor temperature would make the "predictive
-    pre-cooling" results look better or worse than they'd really be.
-    """
+    """Return an outdoor-temperature Series aligned to occupancy_df."""
     if column and column in occupancy_df.columns:
         outdoor = pd.to_numeric(occupancy_df[column], errors='coerce')
         if outdoor.notna().any():
@@ -280,18 +246,7 @@ def resolve_outdoor_temperature(occupancy_df: pd.DataFrame, cfg: HVACConfig, col
 def run_1r1c_strategy(sim_data: pd.DataFrame, strategy_name: str, cfg: HVACConfig) -> pd.DataFrame:
     """
     Run one closed-loop 1R1C HVAC scenario.
-
-    strategy_name:
-        'scheduled'  -> fixed timetable + thermostat baseline
-        'predictive' -> occupancy_now + occupancy_forecast drive the
-                        1R1C future-temperature control decision
-
-    Physical room heat gain ALWAYS uses the CURRENT MEASURED occupancy
-    (occupancy_now), regardless of strategy. The forecast is used only
-    to decide whether to pre-cool.
-
-    Required columns in sim_data: timestamp, occupancy_now,
-    occupancy_forecast_15min, outdoor_temperature_C
+    strategy_name: 'scheduled' or 'predictive'
     """
     if strategy_name not in ('scheduled', 'predictive'):
         raise ValueError("strategy_name must be 'scheduled' or 'predictive'")
@@ -315,16 +270,15 @@ def run_1r1c_strategy(sim_data: pd.DataFrame, strategy_name: str, cfg: HVACConfi
         T_outdoor_C = float(row['outdoor_temperature_C'])
 
         occ_now_control, occ_now_state, occ_now_description = classify_occupancy_state(occ_now)
+        occ_future_control, occ_future_state, occ_future_description = classify_occupancy_state(occ_future)
 
         if strategy_name == 'scheduled':
             control_update = True
             hvac_enable = scheduled_enable(timestamp, cfg)
-
             scheduled_cooling_on, Q_cooling_W, _, _ = thermostat_cooling(
                 T_room_C, hvac_enable, scheduled_cooling_on, cfg
             )
             cooling_on = bool(Q_cooling_W > 0)
-
             T_future_no_hvac_C = forecast_1r1c_temperature(
                 T_room_C, T_outdoor_C, occ_now_control, occ_now_control, cfg, Q_cooling_W=0.0
             )
@@ -332,21 +286,16 @@ def run_1r1c_strategy(sim_data: pd.DataFrame, strategy_name: str, cfg: HVACConfi
             predictive_Q_command_W = 0.0
             occupancy_state, state_description = occ_now_state, occ_now_description
 
-        else:
-            control_update = (i % cfg.control_steps == 0)
-
-            if control_update:
-                (
-                    current_predictive_Q_W,
-                    current_T_future_no_hvac_C,
-                    current_T_future_with_command_C,
-                    current_state_label,
-                    current_state_description
-                ) = minimum_predictive_cooling(T_room_C, T_outdoor_C, occ_now, occ_future, cfg)
-
+        else: # predictive
+            # Update every step (5 mins) using t+15 occupant prediction
+            control_update = True
+            
+            (current_predictive_Q_W, current_state_label,
+             current_state_description) = minimum_predictive_cooling(
+                T_room_C, occ_future, current_predictive_Q_W, cfg
+            )
+            
             predictive_Q_command_W = current_predictive_Q_W
-            T_future_no_hvac_C = current_T_future_no_hvac_C
-            T_future_with_command_C = current_T_future_with_command_C
             occupancy_state = current_state_label
             state_description = current_state_description
 
@@ -354,9 +303,17 @@ def run_1r1c_strategy(sim_data: pd.DataFrame, strategy_name: str, cfg: HVACConfi
                 Q_cooling_W = 0.0
             else:
                 Q_cooling_W = float(np.clip(predictive_Q_command_W, 0.0, cfg.q_cooling_max_w))
-
+            
             cooling_on = bool(Q_cooling_W > 0)
             hvac_enable = cooling_on
+
+            # Calculate t+15 future temp purely for logging/reporting (not used for control)
+            T_future_no_hvac_C = forecast_1r1c_temperature(
+                T_room_C, T_outdoor_C, occ_now_control, occ_future_control, cfg, Q_cooling_W=0.0
+            )
+            T_future_with_command_C = forecast_1r1c_temperature(
+                T_room_C, T_outdoor_C, occ_now_control, occ_future_control, cfg, Q_cooling_W=Q_cooling_W
+            )
 
         # Physical heat gain ALWAYS uses the true, currently-measured occupancy.
         Q_occupancy_W = occ_now * cfg.heat_gain_per_person_w
@@ -408,13 +365,7 @@ def run_1r1c_strategy(sim_data: pd.DataFrame, strategy_name: str, cfg: HVACConfi
 
 
 def calculate_kpis(result_df: pd.DataFrame, cfg: HVACConfig) -> dict:
-    """
-    KPIs are computed over working hours only -- rows outside the
-    window defined by cfg.schedule_start_hour, cfg.schedule_end_hour,
-    and cfg.schedule_weekdays_only are excluded before any KPI is
-    calculated. This applies to both strategies' result_df (not just
-    'scheduled'), so the comparison stays apples-to-apples.
-    """
+    """KPIs are computed over working hours only."""
     result_df = result_df.loc[working_hours_mask(result_df['timestamp'], cfg)]
 
     if result_df.empty:
@@ -457,27 +408,6 @@ def calculate_kpis(result_df: pd.DataFrame, cfg: HVACConfig) -> dict:
 def run_simulation(occupancy_df: pd.DataFrame, cfg: HVACConfig = None, outdoor_temp_column: str = 'outdoor_temperature_C'):
     """
     Run BOTH strategies and package the results.
-
-    Parameters
-    ----------
-    occupancy_df : pd.DataFrame
-        Must contain:
-          - timestamp                 : the "now" time of each row
-          - occupancy_now              : current, measured occupancy
-          - occupancy_forecast_15min   : forecast occupancy N minutes
-                                          ahead (N = cfg.prediction_horizon_min)
-        Optional:
-          - outdoor_temp_column (default 'outdoor_temperature_C'): if
-            missing, a constant fallback is used (see HVACConfig).
-    cfg : HVACConfig, optional
-        Simulation / building / HVAC parameters. Defaults to
-        DEFAULT_CONFIG (the same prototype values used during
-        development -- calibrate before trusting the numbers).
-
-    Returns
-    -------
-    dict with keys: scheduled_df, predictive_df, comparison_df,
-    summary_df, scheduled_kpi, predictive_kpi, outdoor_source
     """
     cfg = cfg or DEFAULT_CONFIG
 
@@ -536,9 +466,6 @@ def run_simulation(occupancy_df: pd.DataFrame, cfg: HVACConfig = None, outdoor_t
         'predictive_comfort_ok': predictive_df['comfort_ok_when_occupied'],
     })
 
-    # If the caller had ground-truth "actual occupancy 15 min later"
-    # (e.g. a historical backtest), carry it through for validation
-    # plots -- purely informational, never used by the controller.
     if 'occupancy_actual_15min_later' in occupancy_df.columns:
         comparison_df['occupancy_actual_15min_later'] = pd.to_numeric(
             occupancy_df['occupancy_actual_15min_later'], errors='coerce'
